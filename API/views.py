@@ -9,15 +9,13 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 import io
 
-# ===============================
-# FLOWER CLASSIFICATION API
-# ===============================
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Load Flower Model
-flower_model = models.resnet50(pretrained=False)
-flower_model.fc = nn.Linear(2048, 102)
-flower_model.load_state_dict(torch.load("models/fine_tuned_resnet50.pth", map_location="cpu"))
-flower_model.eval()
+#############################################
+# ---------  FLOWER MODEL (LAZY) ----------
+#############################################
+
+flower_model = None
 
 # Flower names
 flower_names = [
@@ -43,23 +41,42 @@ flower_names = [
 flower_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225])
 ])
+
+def get_flower_model():
+    global flower_model
+    if flower_model is None:
+        model = models.resnet50(pretrained=False)
+        model.fc = nn.Linear(2048, 102)
+        state = torch.load("models/fine_tuned_resnet50.pth", map_location="cpu")
+        model.load_state_dict(state, strict=False)
+        model.eval()
+        flower_model = model
+    return flower_model
+
 
 class FlowerPredictionAPI(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
-    def post(self, request, *args, **kwargs):
+    def post(self, request):
         if 'image' not in request.FILES:
             return JsonResponse({'error': 'No image provided'}, status=400)
+
         try:
+            model = get_flower_model()
+
             image = Image.open(request.FILES['image']).convert("RGB")
             image_tensor = flower_transform(image).unsqueeze(0)
+
             with torch.no_grad():
-                output = flower_model(image_tensor)
-                predicted_class = torch.argmax(output, dim=1).item()
-                flower_name = flower_names[predicted_class]
+                output = model(image_tensor)
+                predicted = torch.argmax(output, dim=1).item()
+                flower_name = flower_names[predicted]
+
             return JsonResponse({'flower': flower_name})
+
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=500)
 
@@ -134,32 +151,57 @@ class TransformerNet(nn.Module):
         y = self.deconv3(y)
         return y
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-mosaic_model = TransformerNet().to(device)
-state_dict = torch.load("models/mosaic.pth", map_location=device)
-for key in list(state_dict.keys()):
-    if "running_mean" in key or "running_var" in key:
-        del state_dict[key]
-mosaic_model.load_state_dict(state_dict)
-mosaic_model.eval()
+mosaic_model = None
+
+def get_mosaic_model():
+    global mosaic_model
+    if mosaic_model is None:
+        model = TransformerNet().to(device)
+        state_dict = torch.load("models/mosaic.pth", map_location=device)
+
+        # remove instance norm buffers if present
+        for key in list(state_dict.keys()):
+            if "running_mean" in key or "running_var" in key:
+                del state_dict[key]
+
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
+        mosaic_model = model
+
+    return mosaic_model
+
 
 class MosaicAPI(APIView):
     parser_classes = [MultiPartParser, FormParser]
-    def post(self, request, *args, **kwargs):
+
+    def post(self, request):
         if 'mosaic' not in request.FILES:
             return HttpResponse("No image provided", status=400)
+
         try:
-            mosaic = Image.open(request.FILES['mosaic']).convert("RGB")
-            transform_pipeline = transforms.Compose([transforms.ToTensor(), transforms.Lambda(lambda x: x.mul(255))])
-            img = transform_pipeline(mosaic).unsqueeze(0).to(device)
+            model = get_mosaic_model()
+
+            img = Image.open(request.FILES['mosaic']).convert("RGB")
+
+            transform_pipeline = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.mul(255))
+            ])
+
+            tensor = transform_pipeline(img).unsqueeze(0).to(device)
+
             with torch.no_grad():
-                output = mosaic_model(img).cpu()
-            output_data = output[0].clamp(0, 255).div(255)
-            output_image = transforms.ToPILImage()(output_data)
+                out = model(tensor).cpu()
+
+            out = out[0].clamp(0, 255).div(255)
+            output_image = transforms.ToPILImage()(out)
+
             buf = io.BytesIO()
-            output_image.save(buf, format='JPEG')
+            output_image.save(buf, format="JPEG")
             buf.seek(0)
-            return HttpResponse(buf, content_type='image/jpeg')
+
+            return HttpResponse(buf, content_type="image/jpeg")
+
         except Exception as e:
             return HttpResponse(f"Error: {str(e)}", status=500)
 
@@ -275,27 +317,50 @@ class Transformer(nn.Module):
         y = torch.tanh(self.deconv03_1(self.refpad12_1(y)))
         return y
 
-anime_model = Transformer().to(device)
-state_dict = torch.load("models/shinkai_makoto.pth", map_location=device)
-anime_model.load_state_dict(state_dict)
-anime_model.eval()
+anime_model = None
+
+def get_anime_model():
+    global anime_model
+    if anime_model is None:
+        model = Transformer().to(device)
+        state = torch.load("models/shinkai_makoto.pth", map_location=device)
+        model.load_state_dict(state, strict=False)
+        model.eval()
+        anime_model = model
+
+    return anime_model
+
 
 class AnimeAPI(APIView):
     parser_classes = [MultiPartParser, FormParser]
-    def post(self, request, *args, **kwargs):
+
+    def post(self, request):
         if 'anime' not in request.FILES:
             return HttpResponse("No image provided", status=400)
+
         try:
-            anime_img = Image.open(request.FILES['anime']).convert("RGB")
-            transform_pipeline = transforms.Compose([transforms.ToTensor(), transforms.Lambda(lambda x: x*2-1)])
-            img_tensor = transform_pipeline(anime_img).unsqueeze(0).to(device)
+            model = get_anime_model()
+
+            img = Image.open(request.FILES['anime']).convert("RGB")
+
+            transform = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Lambda(lambda x: x * 2 - 1)
+            ])
+
+            t = transform(img).unsqueeze(0).to(device)
+
             with torch.no_grad():
-                output_tensor = anime_model(img_tensor)
-            output_tensor = (output_tensor.squeeze(0).cpu()+1)/2
-            output_image = transforms.ToPILImage()(output_tensor.clamp(0,1))
+                out = model(t)
+
+            out = (out.squeeze(0).cpu() + 1) / 2
+            out = transforms.ToPILImage()(out.clamp(0, 1))
+
             buf = io.BytesIO()
-            output_image.save(buf, format='PNG')
+            out.save(buf, format="PNG")
             buf.seek(0)
-            return HttpResponse(buf, content_type='image/png')
+
+            return HttpResponse(buf, content_type="image/png")
+
         except Exception as e:
             return HttpResponse(f"Error: {str(e)}", status=500)
